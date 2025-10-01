@@ -68,11 +68,13 @@ func (b *AMQPBroker) isDirectExchange() bool {
 // declares and binds the queue, and enables publish notifications
 func NewAMQPBroker(configProvider config.ConfigProvider) (broker.Broker, error) {
 	cfg := configProvider.GetConfig()
+	amqpErrorChannel := make(chan *amqp.Error, 1)
 	stopChannel := make(chan struct{})
 	doneStopChannel := make(chan struct{})
 	amqpBroker := &AMQPBroker{
 		config:           cfg,
 		connectionsMutex: sync.Mutex{},
+		amqpErrorChannel: amqpErrorChannel,
 		stopChannel:      stopChannel,
 		doneStopChannel:  doneStopChannel,
 		amqpProvider:     globalAmqpProvider,
@@ -87,17 +89,18 @@ func NewAMQPBroker(configProvider config.ConfigProvider) (broker.Broker, error) 
 		logger.ApplicationLogger.Error("failed to created connection pool, return", err)
 		return nil, err
 	}
+	if cfg.AMQP.CrashOnConnectionError {
+		// Get a connection for error monitoring
+		conn, err := amqpBroker.getConnection()
+		if err != nil {
+			logger.ApplicationLogger.Error("failed to get connection for error monitoring, return", err)
+			return nil, err
+		}
+		amqpBroker.connection = conn
 
-	// Get a connection for error monitoring
-	conn, err := amqpBroker.getConnection()
-	if err != nil {
-		logger.ApplicationLogger.Error("failed to get connection for error monitoring, return", err)
-		return nil, err
+		// Set up error channel monitoring
+		amqpBroker.amqpErrorChannel = conn.NotifyClose(make(chan *amqp.Error, 1))
 	}
-	amqpBroker.connection = conn
-
-	// Set up error channel monitoring
-	amqpBroker.amqpErrorChannel = conn.NotifyClose(make(chan *amqp.Error, 1))
 
 	// Set up exchange, queue, and binding
 	if err := amqpBroker.setupExchangeQueueBinding(); err != nil {
@@ -147,18 +150,26 @@ func (b *AMQPBroker) Publish(ctx context.Context, signature *schema.Signature) e
 		signature.RoutingKey = b.getRoutingKey()
 	}
 
-	err = b.amqpProvider.AmqpPublishWithConfirm(ctx, signature.RoutingKey, amqpPublishMessage, b.getExchangeName())
-	if err != nil {
-		logger.ApplicationLogger.Error("failed to publish message to AMQP, connection may be lost", err)
-		// Check if this is a connection error and crash the worker
-		if b.isConnectionError(err) {
-			logger.ApplicationLogger.Error("AMQP connection error detected during publish, crashing worker", err)
-			panic(fmt.Sprintf("AMQP connection lost during publish: %v", err))
+	if !b.shouldCrashOnConnectionErrors() {
+		return b.amqpProvider.AmqpPublishWithConfirm(ctx, signature.RoutingKey, amqpPublishMessage, b.getExchangeName())
+	} else {
+		err = b.amqpProvider.AmqpPublishWithConfirm(ctx, signature.RoutingKey, amqpPublishMessage, b.getExchangeName())
+		if err != nil {
+			logger.ApplicationLogger.Error("failed to publish message to AMQP, connection may be lost", err)
+			// Check if this is a connection error and crash the worker
+			if b.isConnectionError(err) {
+				if b.shouldCrashOnConnectionErrors() {
+					logger.ApplicationLogger.Error("AMQP connection error detected during publish, crashing worker", err)
+					panic(fmt.Sprintf("AMQP connection lost during publish: %v", err))
+				}
+				// If not crashing, just return error to caller
+			}
+			return err
 		}
-		return err
+
+		return nil
 	}
 
-	return nil
 }
 
 // prepareMessageBodyAndHeaders returns the AMQP message body and headers.
@@ -307,39 +318,52 @@ func (b *AMQPBroker) StartConsumer(ctx context.Context, workerGroup workergroup.
 
 	conn, err := b.getConnection()
 	if err != nil {
-		logger.ApplicationLogger.Error("failed to get connection for consumer, crashing worker", err)
-		panic(fmt.Sprintf("AMQP connection failed: %v", err))
+		logger.ApplicationLogger.Error("failed to get connection for consumer", err)
+		if b.shouldCrashOnConnectionErrors() {
+			panic(fmt.Sprintf("AMQP connection failed: %v", err))
+		}
+		return err
 	}
 	defer func(amqpProvider provider.AmqpProviderInterface, i interface{}) {
 		err := b.amqpProvider.ReleaseConnectionToPool(i)
 		if err != nil {
-			logger.ApplicationLogger.Error("failed to release connection to pool", err)
+			//TODO:error handling
 		}
 	}(b.amqpProvider, conn)
 
 	// Create a channel
 	channel, _, err := b.amqpProvider.CreateAmqpChannel(conn, false)
 	if err != nil {
-		logger.ApplicationLogger.Error("failed to create AMQP channel, crashing worker", err)
-		panic(fmt.Sprintf("AMQP channel creation failed: %v", err))
+		logger.ApplicationLogger.Error("failed to create AMQP channel", err)
+		if b.shouldCrashOnConnectionErrors() {
+			panic(fmt.Sprintf("AMQP channel creation failed: %v", err))
+		}
+		return err
 	}
 	defer func(channel *amqp.Channel) {
 		err := b.amqpProvider.CloseAmqpChannel(channel)
 		if err != nil {
-			logger.ApplicationLogger.Error("failed to close AMQP channel", err)
+			logger.ApplicationLogger.Error("failed to start consumer, exit", err)
+			//TODO:error handling
 		}
 	}(channel)
 
 	// Channel QOS
 	if err = b.amqpProvider.SetChannelQoS(channel, b.getQueuePrefetchCount()); err != nil {
-		logger.ApplicationLogger.Error("failed to set channel qos, crashing worker", err)
-		panic(fmt.Sprintf("AMQP channel QoS setup failed: %v", err))
+		logger.ApplicationLogger.Error("failed to set channel qos", err)
+		if b.shouldCrashOnConnectionErrors() {
+			panic(fmt.Sprintf("AMQP channel QoS setup failed: %v", err))
+		}
+		return err
 	}
 
 	deliveries, err := b.amqpProvider.CreateConsumer(channel, queueName, workerGroup.GetWorkerGroupName())
 	if err != nil {
-		logger.ApplicationLogger.Error("failed to create consumer, crashing worker", err)
-		panic(fmt.Sprintf("AMQP consumer creation failed: %v", err))
+		logger.ApplicationLogger.Error("failed to create consumer", err)
+		if b.shouldCrashOnConnectionErrors() {
+			panic(fmt.Sprintf("AMQP consumer creation failed: %v", err))
+		}
+		return err
 	}
 
 	logger.ApplicationLogger.Info("[*] Waiting for messages. To exit press CTRL+C")
@@ -349,28 +373,36 @@ func (b *AMQPBroker) StartConsumer(ctx context.Context, workerGroup workergroup.
 	amqpErrorChannel := b.amqpErrorChannel
 
 	// Start a goroutine to monitor the consumer connection for errors
-	go func() {
-		// Monitor channel close notifications
-		channelCloseChan := channel.NotifyClose(make(chan *amqp.Error, 1))
-		select {
-		case channelErr := <-channelCloseChan:
-			if channelErr != nil {
-				logger.ApplicationLogger.Error("AMQP channel closed unexpectedly, crashing worker", channelErr)
-				errorsChan <- fmt.Errorf("AMQP channel closed: %v", channelErr)
+	if b.shouldCrashOnConnectionErrors() {
+		go func() {
+			// Monitor channel close notifications
+			channelCloseChan := channel.NotifyClose(make(chan *amqp.Error, 1))
+			select {
+			case channelErr := <-channelCloseChan:
+				if channelErr != nil {
+					logger.ApplicationLogger.Error("AMQP channel closed unexpectedly", channelErr)
+					errorsChan <- fmt.Errorf("AMQP channel closed: %v", channelErr)
+				}
+			case <-ctx.Done():
+				return
 			}
-		case <-ctx.Done():
-			return
-		}
-	}()
+		}()
+	}
 
 	for {
 		select {
 		case amqpErr := <-amqpErrorChannel:
-			logger.ApplicationLogger.Error("AMQP connection lost, crashing worker", amqpErr)
-			panic(fmt.Sprintf("AMQP connection lost: %v", amqpErr))
+			logger.ApplicationLogger.Error("AMQP connection lost", amqpErr)
+			if b.shouldCrashOnConnectionErrors() {
+				panic(fmt.Sprintf("AMQP connection lost: %v", amqpErr))
+			}
+			return amqpErr
 		case err := <-errorsChan:
-			logger.ApplicationLogger.Error("AMQP error detected, crashing worker", err)
-			panic(fmt.Sprintf("AMQP error: %v", err))
+			logger.ApplicationLogger.Error("AMQP error detected", err)
+			if b.shouldCrashOnConnectionErrors() {
+				panic(fmt.Sprintf("AMQP error: %v", err))
+			}
+			return err
 		case d := <-deliveries:
 			b.processingWG.Add(1)
 			err := b.processDelivery(ctx, d, workerGroup)
@@ -380,10 +412,14 @@ func (b *AMQPBroker) StartConsumer(ctx context.Context, workerGroup workergroup.
 		case <-b.stopChannel:
 			b.doneStopChannel <- struct{}{}
 			logger.ApplicationLogger.Warning("stop request in consumer, exit")
-			b.processingWG.Wait()
+			if b.shouldCrashOnConnectionErrors() {
+				b.processingWG.Wait()
+			}
 			return nil
 		}
 	}
+	b.processingWG.Wait()
+	return nil
 }
 
 func (b *AMQPBroker) getDelayedQueue() string {
@@ -466,6 +502,14 @@ func (b *AMQPBroker) isConnectionError(err error) bool {
 	}
 
 	return false
+}
+
+// shouldCrashOnConnectionErrors returns whether the consumer should crash on AMQP errors
+func (b *AMQPBroker) shouldCrashOnConnectionErrors() bool {
+	if b == nil || b.config == nil || b.config.AMQP == nil {
+		return true
+	}
+	return b.config.AMQP.CrashOnConnectionError
 }
 
 // CheckConnectionHealth verifies if the AMQP connection is still healthy
